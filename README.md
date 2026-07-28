@@ -6,6 +6,13 @@ It connects to `mail.privateemail.com` over IMAP and SMTP so Claude Code can rea
 This server is built for the Namecheap email provider called PrivateEmail.
 It is session scoped by design. Everything runs while Claude Code is connected to the server. There are no background workers, schedulers, or durable campaign daemons.
 
+## Reliability notes (v1.1.1)
+
+- Each IMAP tool call uses its own short-lived connection instead of one shared mailbox session
+- Inbox listings use header and snippet fetches instead of downloading full message bodies
+- Tool failures return clearer, agent-friendly error messages for bad UIDs, missing folders, and auth issues
+- Prompts such as `draft_reply` send compact email payloads instead of full HTML blobs
+
 ## What it does
 
 - Reads inbox messages, threads, and attachments

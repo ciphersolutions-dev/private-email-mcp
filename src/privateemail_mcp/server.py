@@ -17,7 +17,8 @@ from pydantic import Field
 
 from privateemail_mcp import __version__
 from privateemail_mcp.config import get_config
-from privateemail_mcp.mail.imap_client import get_imap, normalize_folder
+from privateemail_mcp.errors import run_imap_tool, validate_folder, validate_uid
+from privateemail_mcp.mail.imap_client import imap_session, normalize_folder
 from privateemail_mcp.mail.parsing import build_message
 from privateemail_mcp.mail.smtp_client import get_smtp
 
@@ -42,6 +43,39 @@ mcp = FastMCP(
 
 def _json(data: Any) -> str:
     return json.dumps(data, indent=2, default=str)
+
+
+def _trim_text(value: str, limit: int = 4000) -> str:
+    value = (value or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
+
+
+def _prompt_email_payload(detail: Any) -> dict[str, Any]:
+    """Return a compact email shape for prompts.
+
+    Prompts should not receive giant raw headers or full HTML blobs because that
+    makes Claude-style clients noisy and brittle.
+    """
+    text_body = detail.text_body or ""
+    if not text_body and detail.html_body:
+        text_body = _trim_text(detail.html_body, 2000)
+    return {
+        "uid": detail.uid,
+        "folder": detail.folder,
+        "subject": detail.subject,
+        "from_addr": detail.from_addr,
+        "to_addrs": detail.to_addrs,
+        "cc_addrs": detail.cc_addrs,
+        "date": detail.date,
+        "message_id": detail.message_id,
+        "in_reply_to": detail.in_reply_to,
+        "references": detail.references,
+        "flags": detail.flags,
+        "attachments": [a.to_dict() for a in detail.attachments],
+        "text_body": _trim_text(text_body, 6000),
+    }
 
 
 def _split_addrs(value: str | None) -> list[str]:
@@ -85,35 +119,39 @@ async def resource_account() -> str:
 @mcp.resource("privateemail://folders")
 async def resource_folders() -> str:
     """IMAP folder tree."""
-    get_config().validate()
-    imap = await get_imap()
-    return _json({"folders": await imap.list_folders()})
+    folders = await run_imap_tool("list folders", lambda imap: imap.list_folders())
+    return _json({"folders": folders})
 
 
 @mcp.resource("privateemail://inbox/recent")
 async def resource_inbox_recent() -> str:
     """Newest 15 messages in INBOX (summaries)."""
-    get_config().validate()
-    imap = await get_imap()
-    summaries = await imap.fetch_summaries("INBOX", limit=15)
+    summaries = await run_imap_tool(
+        "list recent inbox messages",
+        lambda imap: imap.fetch_summaries("INBOX", limit=15),
+    )
     return _json({"emails": [s.to_dict() for s in summaries]})
 
 
 @mcp.resource("privateemail://inbox/unread")
 async def resource_inbox_unread() -> str:
     """Unread messages in INBOX (up to 25 summaries)."""
-    get_config().validate()
-    imap = await get_imap()
-    summaries = await imap.fetch_summaries("INBOX", limit=25, unread_only=True)
+    summaries = await run_imap_tool(
+        "list unread inbox messages",
+        lambda imap: imap.fetch_summaries("INBOX", limit=25, unread_only=True),
+    )
     return _json({"emails": [s.to_dict() for s in summaries]})
 
 
 @mcp.resource("privateemail://email/{folder}/{uid}")
 async def resource_email(folder: str, uid: str) -> str:
     """Full message body for a folder + IMAP UID."""
-    get_config().validate()
-    imap = await get_imap()
-    detail = await imap.fetch_email(folder, uid)
+    folder = validate_folder(folder)
+    uid = validate_uid(uid)
+    detail = await run_imap_tool(
+        "fetch email",
+        lambda imap: imap.fetch_email(folder, uid),
+    )
     return _json(detail.to_dict())
 
 
@@ -125,9 +163,10 @@ async def resource_email(folder: str, uid: str) -> str:
 @mcp.prompt()
 async def summarize_inbox(limit: int = 15) -> list[base.Message]:
     """Summarize recent INBOX mail and flag what needs action."""
-    get_config().validate()
-    imap = await get_imap()
-    summaries = await imap.fetch_summaries("INBOX", limit=limit)
+    summaries = await run_imap_tool(
+        "summarize inbox",
+        lambda imap: imap.fetch_summaries("INBOX", limit=limit),
+    )
     payload = _json([s.to_dict() for s in summaries])
     return [
         base.UserMessage(
@@ -140,13 +179,18 @@ async def summarize_inbox(limit: int = 15) -> list[base.Message]:
 @mcp.prompt()
 async def draft_reply(uid: str, folder: str = "INBOX", tone: str = "professional") -> list[base.Message]:
     """Draft a reply to a specific message (does not send)."""
-    get_config().validate()
-    imap = await get_imap()
-    detail = await imap.fetch_email(folder, uid)
+    folder = validate_folder(folder)
+    uid = validate_uid(uid)
+    detail = await run_imap_tool(
+        "draft reply",
+        lambda imap: imap.fetch_email(folder, uid),
+    )
+    payload = _prompt_email_payload(detail)
     return [
         base.UserMessage(
-            f"Draft a {tone} reply to this email. Return subject + body only; do not send unless asked.\n\n"
-            f"{_json(detail.to_dict())}"
+            f"Draft a {tone} reply to this email. Return only two sections: Subject and Body. "
+            f"Keep the reply human, relevant, and concise. Do not send unless asked.\n\n"
+            f"{_json(payload)}"
         )
     ]
 
@@ -172,9 +216,10 @@ async def compose_email(
 @mcp.prompt()
 async def triage_unread(limit: int = 25) -> list[base.Message]:
     """Triage unread mail: archive, reply, or follow-up."""
-    get_config().validate()
-    imap = await get_imap()
-    summaries = await imap.fetch_summaries("INBOX", limit=limit, unread_only=True)
+    summaries = await run_imap_tool(
+        "triage unread mail",
+        lambda imap: imap.fetch_summaries("INBOX", limit=limit, unread_only=True),
+    )
     return [
         base.UserMessage(
             "Triage these unread PrivateEmail messages. For each: "
@@ -203,9 +248,9 @@ async def health_check() -> str:
     """Test IMAP and SMTP connectivity to mail.privateemail.com."""
     cfg = get_config()
     cfg.validate()
-    imap = await get_imap()
+    async with imap_session() as imap:
+        imap_result = await imap.health_check()
     smtp = get_smtp()
-    imap_result = await imap.health_check()
     try:
         smtp_result = await smtp.health_check()
     except Exception as e:
@@ -253,9 +298,8 @@ async def account_info() -> str:
 )
 async def list_folders() -> str:
     """List IMAP folders in the PrivateEmail mailbox."""
-    get_config().validate()
-    imap = await get_imap()
-    return _json({"folders": await imap.list_folders()})
+    folders = await run_imap_tool("list folders", lambda imap: imap.list_folders())
+    return _json({"folders": folders})
 
 
 @mcp.tool(
@@ -276,10 +320,12 @@ async def list_emails(
     ] = None,
 ) -> str:
     """List recent email summaries in a folder."""
-    get_config().validate()
-    imap = await get_imap()
-    summaries = await imap.fetch_summaries(
-        folder, limit=limit, unread_only=unread_only, since=since
+    folder = validate_folder(folder)
+    summaries = await run_imap_tool(
+        "list emails",
+        lambda imap: imap.fetch_summaries(
+            folder, limit=limit, unread_only=unread_only, since=since
+        ),
     )
     return _json({"folder": normalize_folder(folder), "emails": [s.to_dict() for s in summaries]})
 
@@ -306,21 +352,24 @@ async def search_emails(
     limit: Annotated[int, Field(ge=1, le=100)] = 50,
 ) -> str:
     """Search emails with IMAP criteria. Dates are YYYY-MM-DD."""
-    get_config().validate()
-    imap = await get_imap()
-    uids = await imap.search(
-        folder,
-        from_addr=from_addr,
-        to_addr=to_addr,
-        subject=subject,
-        body=body,
-        text=text,
-        before=before,
-        after=after,
-        unread=unread,
-        limit=limit,
-    )
-    summaries = await imap.fetch_summaries(folder, uids=uids, limit=limit)
+    folder = validate_folder(folder)
+
+    async def _search(imap):
+        uids = await imap.search(
+            folder,
+            from_addr=from_addr,
+            to_addr=to_addr,
+            subject=subject,
+            body=body,
+            text=text,
+            before=before,
+            after=after,
+            unread=unread,
+            limit=limit,
+        )
+        return await imap.fetch_summaries(folder, uids=uids, limit=limit)
+
+    summaries = await run_imap_tool("search emails", _search)
     return _json(
         {
             "folder": normalize_folder(folder),
@@ -344,9 +393,13 @@ async def get_email(
     folder: Annotated[str, Field(description="IMAP folder")] = "INBOX",
 ) -> str:
     """Fetch full email by UID including text/html and attachment metadata."""
-    get_config().validate()
-    imap = await get_imap()
-    return _json((await imap.fetch_email(folder, uid)).to_dict())
+    folder = validate_folder(folder)
+    uid = validate_uid(uid)
+    detail = await run_imap_tool(
+        "get email",
+        lambda imap: imap.fetch_email(folder, uid),
+    )
+    return _json(detail.to_dict())
 
 
 @mcp.tool(
@@ -364,9 +417,12 @@ async def get_thread(
     limit: Annotated[int, Field(ge=1, le=100)] = 50,
 ) -> str:
     """Fetch a conversation thread related to the given message UID."""
-    get_config().validate()
-    imap = await get_imap()
-    thread = await imap.get_thread(folder, uid, limit=limit)
+    folder = validate_folder(folder)
+    uid = validate_uid(uid)
+    thread = await run_imap_tool(
+        "get thread",
+        lambda imap: imap.get_thread(folder, uid, limit=limit),
+    )
     return _json({"folder": normalize_folder(folder), "messages": [m.to_dict() for m in thread]})
 
 
@@ -388,9 +444,13 @@ async def download_attachment(
     ] = None,
 ) -> str:
     """Download an attachment by part_index from get_email."""
-    get_config().validate()
-    imap = await get_imap()
-    return _json(await imap.download_attachment(folder, uid, part_index, save_path=save_path))
+    folder = validate_folder(folder)
+    uid = validate_uid(uid)
+    result = await run_imap_tool(
+        "download attachment",
+        lambda imap: imap.download_attachment(folder, uid, part_index, save_path=save_path),
+    )
+    return _json(result)
 
 
 # ---------------------------------------------------------------------------
@@ -462,8 +522,12 @@ async def reply_email(
     get_config().validate()
     if not text and not html:
         raise ValueError("Provide text and/or html body")
-    imap = await get_imap()
-    original = await imap.fetch_email(folder, uid)
+    folder = validate_folder(folder)
+    uid = validate_uid(uid)
+    original = await run_imap_tool(
+        "reply to email",
+        lambda imap: imap.fetch_email(folder, uid),
+    )
     _, from_addr = parseaddr(original.from_addr)
     to = from_addr or original.from_addr
     cc = None
@@ -510,9 +574,12 @@ async def forward_email(
     note: Annotated[str | None, Field(description="Optional note above forwarded content")] = None,
 ) -> str:
     """Forward an email by UID to a new recipient."""
-    get_config().validate()
-    imap = await get_imap()
-    original = await imap.fetch_email(folder, uid)
+    folder = validate_folder(folder)
+    uid = validate_uid(uid)
+    original = await run_imap_tool(
+        "forward email",
+        lambda imap: imap.fetch_email(folder, uid),
+    )
     body = (note + "\n\n" if note else "") + (
         "---------- Forwarded message ----------\n"
         f"From: {original.from_addr}\n"
@@ -556,8 +623,10 @@ async def save_draft(
         cc=_split_addrs(cc),
         display_name=cfg.display_name or None,
     )
-    imap = await get_imap()
-    status = await imap.append_draft(msg.as_bytes())
+    status = await run_imap_tool(
+        "save draft",
+        lambda imap: imap.append_draft(msg.as_bytes()),
+    )
     return _json({"status": status, "subject": subject, "to": to})
 
 
@@ -574,9 +643,10 @@ async def list_drafts(
     limit: Annotated[int, Field(ge=1, le=100)] = 25,
 ) -> str:
     """List messages in the Drafts folder."""
-    get_config().validate()
-    imap = await get_imap()
-    summaries = await imap.fetch_summaries("Drafts", limit=limit)
+    summaries = await run_imap_tool(
+        "list drafts",
+        lambda imap: imap.fetch_summaries("Drafts", limit=limit),
+    )
     return _json({"emails": [s.to_dict() for s in summaries]})
 
 
@@ -593,9 +663,11 @@ async def send_draft(
     uid: Annotated[str, Field(description="Draft IMAP UID")],
 ) -> str:
     """Send a draft by UID from Drafts, then move it to Trash."""
-    get_config().validate()
-    imap = await get_imap()
-    detail = await imap.fetch_email("Drafts", uid)
+    uid = validate_uid(uid)
+    detail = await run_imap_tool(
+        "read draft",
+        lambda imap: imap.fetch_email("Drafts", uid),
+    )
     result = await get_smtp().send_email(
         to=detail.to_addrs or [""],
         subject=detail.subject,
@@ -603,7 +675,10 @@ async def send_draft(
         html=detail.html_body or None,
         cc=", ".join(detail.cc_addrs) if detail.cc_addrs else None,
     )
-    await imap.delete("Drafts", uid, expunge=False)
+    await run_imap_tool(
+        "delete draft",
+        lambda imap: imap.delete("Drafts", uid, expunge=False),
+    )
     return _json({"draft_uid": uid, **result})
 
 
@@ -622,9 +697,13 @@ async def move_email(
     folder: Annotated[str, Field(description="Source folder")] = "INBOX",
 ) -> str:
     """Move an email to another folder."""
-    get_config().validate()
-    imap = await get_imap()
-    status = await imap.move(folder, uid, dest_folder)
+    folder = validate_folder(folder)
+    uid = validate_uid(uid)
+    dest_folder = validate_folder(dest_folder)
+    status = await run_imap_tool(
+        "move email",
+        lambda imap: imap.move(folder, uid, dest_folder),
+    )
     return _json({"uid": uid, "from": folder, "to": dest_folder, "status": status})
 
 
@@ -643,9 +722,13 @@ async def copy_email(
     folder: Annotated[str, Field(description="Source folder")] = "INBOX",
 ) -> str:
     """Copy an email to another folder."""
-    get_config().validate()
-    imap = await get_imap()
-    status = await imap.copy(folder, uid, dest_folder)
+    folder = validate_folder(folder)
+    uid = validate_uid(uid)
+    dest_folder = validate_folder(dest_folder)
+    status = await run_imap_tool(
+        "copy email",
+        lambda imap: imap.copy(folder, uid, dest_folder),
+    )
     return _json({"uid": uid, "status": status})
 
 
@@ -666,9 +749,12 @@ async def delete_email(
     ] = False,
 ) -> str:
     """Delete an email (moves to Trash unless expunge=True or already in Trash)."""
-    get_config().validate()
-    imap = await get_imap()
-    status = await imap.delete(folder, uid, expunge=expunge)
+    folder = validate_folder(folder)
+    uid = validate_uid(uid)
+    status = await run_imap_tool(
+        "delete email",
+        lambda imap: imap.delete(folder, uid, expunge=expunge),
+    )
     return _json({"uid": uid, "status": status})
 
 
@@ -688,9 +774,12 @@ async def mark_email(
     flagged: Annotated[bool | None, Field(description="True=flag, False=unflag")] = None,
 ) -> str:
     """Mark email read/unread and/or flagged/unflagged."""
-    get_config().validate()
-    imap = await get_imap()
-    status = await imap.mark(folder, uid, read=read, flagged=flagged)
+    folder = validate_folder(folder)
+    uid = validate_uid(uid)
+    status = await run_imap_tool(
+        "mark email",
+        lambda imap: imap.mark(folder, uid, read=read, flagged=flagged),
+    )
     return _json({"uid": uid, "status": status, "read": read, "flagged": flagged})
 
 
@@ -707,9 +796,9 @@ async def create_folder(
     name: Annotated[str, Field(description="New folder name", min_length=1)],
 ) -> str:
     """Create an IMAP folder."""
-    get_config().validate()
-    imap = await get_imap()
-    return _json({"name": name, "status": await imap.create_folder(name)})
+    name = validate_folder(name)
+    status = await run_imap_tool("create folder", lambda imap: imap.create_folder(name))
+    return _json({"name": name, "status": status})
 
 
 @mcp.tool(
@@ -726,13 +815,17 @@ async def rename_folder(
     new_name: Annotated[str, Field(description="New folder name")],
 ) -> str:
     """Rename an IMAP folder."""
-    get_config().validate()
-    imap = await get_imap()
+    old_name = validate_folder(old_name)
+    new_name = validate_folder(new_name)
+    status = await run_imap_tool(
+        "rename folder",
+        lambda imap: imap.rename_folder(old_name, new_name),
+    )
     return _json(
         {
             "old": old_name,
             "new": new_name,
-            "status": await imap.rename_folder(old_name, new_name),
+            "status": status,
         }
     )
 
@@ -750,9 +843,9 @@ async def delete_folder(
     name: Annotated[str, Field(description="Folder to delete")],
 ) -> str:
     """Delete an IMAP folder."""
-    get_config().validate()
-    imap = await get_imap()
-    return _json({"name": name, "status": await imap.delete_folder(name)})
+    name = validate_folder(name)
+    status = await run_imap_tool("delete folder", lambda imap: imap.delete_folder(name))
+    return _json({"name": name, "status": status})
 
 
 def main() -> None:

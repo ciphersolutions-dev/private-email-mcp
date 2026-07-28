@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import email
 import email.policy
 import logging
@@ -20,6 +19,7 @@ from privateemail_mcp.mail.parsing import (
     parse_flags,
     parse_message_bytes,
     summary_from_detail,
+    _guess_has_attachments,
 )
 
 logger = logging.getLogger("privateemail_mcp.imap")
@@ -65,15 +65,6 @@ class ImapClient:
         except Exception:
             pass
         self._client = None
-
-    @asynccontextmanager
-    async def session(self) -> AsyncIterator[aioimaplib.IMAP4_SSL]:
-        client = await self.connect()
-        try:
-            yield client
-        finally:
-            # Keep connection for reuse within short bursts; caller may close.
-            pass
 
     async def list_folders(self) -> list[dict[str, Any]]:
         client = await self.connect()
@@ -140,17 +131,15 @@ class ImapClient:
             criteria.extend(["BEFORE", self._imap_date(before)])
         if after:
             criteria.extend(["SINCE", self._imap_date(after)])
-        # HEADER Content-Type for attachments is unreliable; skip strict IMAP filter
         if not criteria:
             criteria = ["ALL"]
-        # aioimaplib uid_search(*criteria) — pass tokens separately
         resp = await client.uid_search(*criteria, charset=None)
         if resp.result != "OK":
             raise RuntimeError(f"SEARCH failed: {resp.lines}")
         uids = self._parse_uid_list(resp.lines)
         _ = has_attachment  # reserved for client-side filter later
         uids = uids[-limit:] if limit else uids
-        uids.reverse()  # newest first typically at end
+        uids.reverse()
         return uids
 
     @staticmethod
@@ -160,7 +149,6 @@ class ImapClient:
 
     @staticmethod
     def _imap_date(value: str) -> str:
-        # Accept ISO date or datetime; IMAP wants DD-Mon-YYYY
         raw = value.strip()
         try:
             if "T" in raw:
@@ -177,14 +165,9 @@ class ImapClient:
         for line in lines:
             if isinstance(line, bytes):
                 line = line.decode("utf-8", errors="replace")
-            # Skip OK lines
-            if not line or line.startswith("OK") or "SEARCH" in line.upper() and not any(c.isdigit() for c in line):
-                # Prefer numeric tokens
-                pass
             for tok in str(line).split():
                 if tok.isdigit():
                     uids.append(tok)
-        # Deduplicate preserving order
         seen: set[str] = set()
         out: list[str] = []
         for u in uids:
@@ -214,11 +197,36 @@ class ImapClient:
         results: list[EmailSummary] = []
         for uid in uids:
             try:
-                detail = await self.fetch_email(folder, uid, include_body=False)
-                results.append(summary_from_detail(detail))
+                results.append(await self.fetch_email_summary(folder, uid))
             except Exception as e:
                 logger.warning("Failed to fetch uid %s: %s", uid, e)
         return results
+
+    async def fetch_email_summary(self, folder: str, uid: str) -> EmailSummary:
+        client = await self._select(folder, readonly=True)
+        resp = await client.uid(
+            "fetch",
+            uid,
+            "(FLAGS BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.1024>)",
+        )
+        if resp.result != "OK":
+            raise RuntimeError(f"FETCH {uid} failed: {resp.lines}")
+        header_raw, snippet_raw, flags = self._extract_fetch_sections(resp.lines)
+        if header_raw is None:
+            raise RuntimeError(f"No message data for uid {uid}")
+        detail = parse_message_bytes(
+            header_raw,
+            uid=uid,
+            folder=normalize_folder(folder),
+            flags=flags,
+            include_body=False,
+            snippet_text=self._decode_snippet(snippet_raw),
+        )
+        header_msg = email.message_from_bytes(header_raw, policy=email.policy.default)
+        return summary_from_detail(
+            detail,
+            has_attachments=_guess_has_attachments(header_msg),
+        )
 
     async def fetch_email(
         self,
@@ -228,23 +236,55 @@ class ImapClient:
         include_body: bool = True,
     ) -> EmailDetail:
         client = await self._select(folder, readonly=True)
-        # BODY.PEEK[] avoids setting \Seen
-        fetch_items = "(FLAGS BODY.PEEK[])" if include_body else "(FLAGS BODY.PEEK[HEADER] BODY.PEEK[TEXT]<0.500>)"
-        # Always fetch full for reliable parsing of structure
-        resp = await client.uid("fetch", uid, "(FLAGS BODY.PEEK[])")
+        if include_body:
+            fetch_items = "(FLAGS BODY.PEEK[])"
+        else:
+            fetch_items = "(FLAGS BODY.PEEK[HEADER])"
+        resp = await client.uid("fetch", uid, fetch_items)
         if resp.result != "OK":
             raise RuntimeError(f"FETCH {uid} failed: {resp.lines}")
         raw, flags = self._extract_fetch_payload(resp.lines)
         if raw is None:
             raise RuntimeError(f"No message data for uid {uid}")
-        return parse_message_bytes(raw, uid=uid, folder=normalize_folder(folder), flags=flags)
+        return parse_message_bytes(
+            raw,
+            uid=uid,
+            folder=normalize_folder(folder),
+            flags=flags,
+            include_body=include_body,
+        )
 
     @staticmethod
-    def _extract_fetch_payload(lines: list) -> tuple[bytes | None, list[str]]:
+    def _decode_snippet(raw: bytes | None) -> str:
+        if not raw:
+            return ""
+        try:
+            return raw.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _is_meta_line(text: str) -> bool:
+        upper = text.upper()
+        return (
+            "FETCH (" in upper
+            or text.startswith("FLAGS")
+            or text.startswith("Fetch completed")
+            or text.startswith("OK ")
+            or (len(text) < 200 and "BODY" in upper and "{" in text)
+        )
+
+    @classmethod
+    def _looks_like_email(cls, data: bytes) -> bool:
+        return b"\n" in data and (
+            b"From:" in data[:4000] or b"Subject:" in data[:4000] or b"Return-Path:" in data[:4000]
+        )
+
+    @classmethod
+    def _collect_fetch_chunks(cls, lines: list) -> tuple[list[str], list[bytes]]:
         flags: list[str] = []
         chunks: list[bytes] = []
         for line in lines:
-            # aioimaplib returns message bodies as bytearray
             if isinstance(line, (bytes, bytearray)):
                 data = bytes(line)
                 text_try = None
@@ -253,14 +293,7 @@ class ImapClient:
                 except Exception:
                     chunks.append(data)
                     continue
-                # Meta / status lines from the server (not RFC822)
-                if (
-                    "FETCH (" in text_try
-                    or text_try.startswith("FLAGS")
-                    or text_try.startswith("Fetch completed")
-                    or text_try.startswith("OK ")
-                    or (len(data) < 200 and "BODY" in text_try.upper() and "{" in text_try)
-                ):
+                if cls._is_meta_line(text_try):
                     m = re.search(r"FLAGS\s*\(([^)]*)\)", text_try)
                     if m:
                         flags = parse_flags(m.group(1))
@@ -274,16 +307,27 @@ class ImapClient:
                     m = re.search(r"FLAGS\s*\(([^)]*)\)", s)
                     if m:
                         flags = parse_flags(m.group(1))
+        return flags, chunks
+
+    @classmethod
+    def _extract_fetch_payload(cls, lines: list) -> tuple[bytes | None, list[str]]:
+        flags, chunks = cls._collect_fetch_chunks(lines)
         if not chunks:
             return None, flags
-        # Prefer the largest chunk that looks like an email
-        emailish = [
-            c
-            for c in chunks
-            if b"\n" in c and (b"From:" in c[:4000] or b"Subject:" in c[:4000] or b"Return-Path:" in c[:4000])
-        ]
+        emailish = [c for c in chunks if cls._looks_like_email(c)]
         raw = max(emailish or chunks, key=len)
         return raw, flags
+
+    @classmethod
+    def _extract_fetch_sections(cls, lines: list) -> tuple[bytes | None, bytes | None, list[str]]:
+        flags, chunks = cls._collect_fetch_chunks(lines)
+        if not chunks:
+            return None, None, flags
+        header_chunks = [c for c in chunks if cls._looks_like_email(c)]
+        header_raw = max(header_chunks, key=len) if header_chunks else None
+        body_chunks = [c for c in chunks if c not in header_chunks]
+        snippet_raw = max(body_chunks, key=len) if body_chunks else None
+        return header_raw, snippet_raw, flags
 
     async def get_thread(self, folder: str, uid: str, limit: int = 50) -> list[EmailDetail]:
         root = await self.fetch_email(folder, uid)
@@ -295,7 +339,6 @@ class ImapClient:
         for r in root.references:
             message_ids.add(r.strip())
 
-        # Search by subject as fallback thread key
         subject = root.subject or ""
         clean = re.sub(r"^(re|fw|fwd)\s*:\s*", "", subject, flags=re.I).strip()
         candidates = await self.search(folder, subject=clean or subject, limit=limit)
@@ -386,7 +429,6 @@ class ImapClient:
         if not ops:
             return "no-op"
         for op in ops:
-            # IMAP: UID STORE <uid> +FLAGS (\Seen)
             flag_op, flag_list = op.split(" ", 1)
             resp = await client.uid("store", uid, flag_op, flag_list)
             if resp.result != "OK":
@@ -396,7 +438,6 @@ class ImapClient:
     async def move(self, folder: str, uid: str, dest: str) -> str:
         client = await self._select(folder, readonly=False)
         dest = normalize_folder(dest)
-        # Try MOVE extension; fall back to COPY+DELETE
         try:
             resp = await client.uid("move", uid, dest)
             if resp.result == "OK":
@@ -457,7 +498,6 @@ class ImapClient:
         folder: str,
         flags: str = r"(\Seen)",
     ) -> str:
-        """APPEND a raw RFC822 message into an IMAP folder (e.g. Sent, Drafts)."""
         client = await self.connect()
         folder = normalize_folder(folder)
         resp = await client.append(raw_message, mailbox=folder, flags=flags)
@@ -481,14 +521,11 @@ class ImapClient:
         }
 
 
-# Process-wide shared client
-_shared: ImapClient | None = None
-_lock = asyncio.Lock()
-
-
-async def get_imap() -> ImapClient:
-    global _shared
-    async with _lock:
-        if _shared is None:
-            _shared = ImapClient()
-        return _shared
+@asynccontextmanager
+async def imap_session(cfg: Config | None = None) -> AsyncIterator[ImapClient]:
+    """Open a dedicated IMAP connection for one tool call."""
+    client = ImapClient(cfg)
+    try:
+        yield client
+    finally:
+        await client.close()

@@ -34,6 +34,16 @@ class Config:
             raise ValueError("PRIVATEEMAIL_ADDRESS is not set")
         if not self.password:
             raise ValueError("PRIVATEEMAIL_PASSWORD is not set")
+        if not self.imap_host:
+            raise ValueError("PRIVATEEMAIL_IMAP_HOST is not set")
+        if not self.smtp_host:
+            raise ValueError("PRIVATEEMAIL_SMTP_HOST is not set")
+        if self.imap_port <= 0:
+            raise ValueError("PRIVATEEMAIL_IMAP_PORT must be a positive integer")
+        if self.smtp_port <= 0:
+            raise ValueError("PRIVATEEMAIL_SMTP_PORT must be a positive integer")
+        if self.max_attachment_bytes <= 0:
+            raise ValueError("PRIVATEEMAIL_MAX_ATTACHMENT_BYTES must be a positive integer")
 
 
 def load_config() -> Config:
@@ -48,12 +58,5 @@ def load_config() -> Config:
         max_attachment_bytes=_int("PRIVATEEMAIL_MAX_ATTACHMENT_BYTES", 10 * 1024 * 1024),
     )
 
-
-_cfg: Config | None = None
-
-
 def get_config() -> Config:
-    global _cfg
-    if _cfg is None:
-        _cfg = load_config()
-    return _cfg
+    return load_config()

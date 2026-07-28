@@ -37,11 +37,11 @@ class SmtpClient:
 
     async def _save_to_sent_bytes(self, raw: bytes) -> dict[str, Any]:
         """IMAP APPEND into Sent — SMTP delivery alone does not create a Sent copy."""
-        from privateemail_mcp.mail.imap_client import get_imap
+        from privateemail_mcp.mail.imap_client import imap_session
 
         try:
-            imap = await get_imap()
-            await imap.append_message(raw, "Sent", flags=r"(\Seen)")
+            async with imap_session(self.cfg) as imap:
+                await imap.append_message(raw, "Sent", flags=r"(\Seen)")
             return {"saved_to_sent": True}
         except Exception as e:
             logger.warning("Failed to APPEND copy to Sent: %s", e)

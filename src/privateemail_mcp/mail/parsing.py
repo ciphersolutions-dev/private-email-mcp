@@ -149,15 +149,31 @@ def get_attachment_bytes(msg: Message, part_index: int) -> tuple[str, str, bytes
     raise ValueError(f"Attachment part_index {part_index} not found")
 
 
+def _guess_has_attachments(msg: Message) -> bool:
+    ctype = (msg.get_content_type() or "").lower()
+    if ctype.startswith("multipart/"):
+        return ctype not in {"multipart/alternative", "multipart/related"}
+    disp = str(msg.get("Content-Disposition", "")).lower()
+    return "attachment" in disp
+
+
 def parse_message_bytes(
     raw: bytes,
     *,
     uid: str,
     folder: str,
     flags: list[str] | None = None,
+    include_body: bool = True,
+    snippet_text: str | None = None,
 ) -> EmailDetail:
     msg = email.message_from_bytes(raw, policy=email.policy.default)
-    text_body, html_body = extract_bodies(msg)
+    if include_body:
+        text_body, html_body = extract_bodies(msg)
+        attachments = extract_attachments(msg)
+    else:
+        text_body = snippet_text or ""
+        html_body = ""
+        attachments = []
     refs_raw = decode_mime_header(msg.get("References"))
     references = [r for r in refs_raw.replace(",", " ").split() if r] if refs_raw else []
     headers: dict[str, str] = {}
@@ -178,15 +194,21 @@ def parse_message_bytes(
         flags=flags or [],
         text_body=text_body,
         html_body=html_body,
-        attachments=extract_attachments(msg),
-        raw_headers=headers,
+        attachments=attachments,
+        raw_headers=headers if include_body else {},
     )
 
 
-def summary_from_detail(detail: EmailDetail, snippet_len: int = 160) -> EmailSummary:
+def summary_from_detail(
+    detail: EmailDetail,
+    snippet_len: int = 160,
+    *,
+    has_attachments: bool | None = None,
+) -> EmailSummary:
     snippet = (detail.text_body or "").replace("\n", " ").strip()
     if len(snippet) > snippet_len:
         snippet = snippet[: snippet_len - 1] + "…"
+    attachment_flag = has_attachments if has_attachments is not None else bool(detail.attachments)
     return EmailSummary(
         uid=detail.uid,
         folder=detail.folder,
@@ -196,7 +218,7 @@ def summary_from_detail(detail: EmailDetail, snippet_len: int = 160) -> EmailSum
         date=detail.date,
         message_id=detail.message_id,
         flags=detail.flags,
-        has_attachments=bool(detail.attachments),
+        has_attachments=attachment_flag,
         snippet=snippet,
     )
 
