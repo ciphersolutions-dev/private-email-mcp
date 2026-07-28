@@ -498,12 +498,17 @@ class ImapClient:
         folder: str,
         flags: str = r"(\Seen)",
     ) -> str:
-        client = await self.connect()
+        """APPEND via stdlib imaplib with retries (aioimaplib APPEND is unreliable)."""
+        from privateemail_mcp.mail.append import append_with_retries
+
         folder = normalize_folder(folder)
-        resp = await client.append(raw_message, mailbox=folder, flags=flags)
-        if resp.result != "OK":
-            raise RuntimeError(f"APPEND to {folder} failed: {resp.lines}")
-        return "appended"
+        result = await append_with_retries(
+            self.cfg,
+            raw_message,
+            folder,
+            flags=flags,
+        )
+        return result["status"]
 
     async def append_draft(self, raw_message: bytes, folder: str = "Drafts") -> str:
         await self.append_message(raw_message, folder, flags=r"(\Draft \Seen)")

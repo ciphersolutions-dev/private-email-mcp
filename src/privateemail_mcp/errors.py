@@ -49,6 +49,22 @@ def map_mail_error(exc: Exception, *, action: str) -> ToolError:
             "this release uses one IMAP connection per call to avoid mailbox races."
         )
 
+    # Must run before generic timeout matching — Sent archive errors often nest timeouts.
+    if "saving a copy to the sent folder failed" in lower or (
+        "smtp" in lower and "sent folder" in lower
+    ):
+        return ToolError(
+            "PrivateEmail delivered the email over SMTP, but failed to archive it "
+            f"in Sent after retries: {message}. Recipients still received it. "
+            "Reconnect IMAP and retry only if you need the Sent copy repaired."
+        )
+
+    if "append" in lower and ("failed" in lower or "timeout" in lower or "timed out" in lower):
+        return ToolError(
+            f"PrivateEmail IMAP APPEND failed while {action}: {message}. "
+            "This is usually a transient IMAP connection issue — retry the tool."
+        )
+
     if "timeout" in lower or "timed out" in lower:
         return ToolError(
             f"PrivateEmail timed out while {action}. Retry with a smaller limit "

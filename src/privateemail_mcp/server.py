@@ -17,7 +17,7 @@ from pydantic import Field
 
 from privateemail_mcp import __version__
 from privateemail_mcp.config import get_config
-from privateemail_mcp.errors import run_imap_tool, validate_folder, validate_uid
+from privateemail_mcp.errors import map_mail_error, run_imap_tool, validate_folder, validate_uid
 from privateemail_mcp.mail.imap_client import imap_session, normalize_folder
 from privateemail_mcp.mail.parsing import build_message
 from privateemail_mcp.mail.smtp_client import get_smtp
@@ -487,18 +487,21 @@ async def send_email(
         raise ValueError("Provide text and/or html body")
     refs = [r for r in (references or "").split() if r] or None
     smtp = get_smtp()
-    result = await smtp.send_email(
-        to=to,
-        subject=subject,
-        text=text,
-        html=html,
-        cc=cc,
-        bcc=bcc,
-        reply_to=reply_to,
-        in_reply_to=in_reply_to,
-        references=refs,
-        attachments=_attachment_list(attachment_paths),
-    )
+    try:
+        result = await smtp.send_email(
+            to=to,
+            subject=subject,
+            text=text,
+            html=html,
+            cc=cc,
+            bcc=bcc,
+            reply_to=reply_to,
+            in_reply_to=in_reply_to,
+            references=refs,
+            attachments=_attachment_list(attachment_paths),
+        )
+    except Exception as exc:
+        raise map_mail_error(exc, action="send email") from exc
     return _json(result)
 
 
@@ -546,15 +549,18 @@ async def reply_email(
     refs = list(original.references or [])
     if original.message_id:
         refs.append(original.message_id)
-    result = await get_smtp().send_email(
-        to=to,
-        subject=subj,
-        text=text,
-        html=html,
-        cc=cc,
-        in_reply_to=original.message_id,
-        references=refs or None,
-    )
+    try:
+        result = await get_smtp().send_email(
+            to=to,
+            subject=subj,
+            text=text,
+            html=html,
+            cc=cc,
+            in_reply_to=original.message_id,
+            references=refs or None,
+        )
+    except Exception as exc:
+        raise map_mail_error(exc, action="reply to email") from exc
     return _json({"replied_to_uid": uid, **result})
 
 
@@ -591,7 +597,10 @@ async def forward_email(
     subj = original.subject or ""
     if not subj.lower().startswith("fwd:"):
         subj = f"Fwd: {subj}"
-    result = await get_smtp().send_email(to=to, subject=subj, text=body)
+    try:
+        result = await get_smtp().send_email(to=to, subject=subj, text=body)
+    except Exception as exc:
+        raise map_mail_error(exc, action="forward email") from exc
     return _json({"forwarded_uid": uid, **result})
 
 
@@ -668,13 +677,16 @@ async def send_draft(
         "read draft",
         lambda imap: imap.fetch_email("Drafts", uid),
     )
-    result = await get_smtp().send_email(
-        to=detail.to_addrs or [""],
-        subject=detail.subject,
-        text=detail.text_body,
-        html=detail.html_body or None,
-        cc=", ".join(detail.cc_addrs) if detail.cc_addrs else None,
-    )
+    try:
+        result = await get_smtp().send_email(
+            to=detail.to_addrs or [""],
+            subject=detail.subject,
+            text=detail.text_body,
+            html=detail.html_body or None,
+            cc=", ".join(detail.cc_addrs) if detail.cc_addrs else None,
+        )
+    except Exception as exc:
+        raise map_mail_error(exc, action="send draft") from exc
     await run_imap_tool(
         "delete draft",
         lambda imap: imap.delete("Drafts", uid, expunge=False),

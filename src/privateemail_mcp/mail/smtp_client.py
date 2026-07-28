@@ -5,12 +5,14 @@ from __future__ import annotations
 import logging
 import uuid
 from email.message import EmailMessage
+from email.policy import SMTP as SMTP_POLICY
 from email.utils import format_datetime, getaddresses
 from typing import Any
 
 import aiosmtplib
 
 from privateemail_mcp.config import Config, get_config
+from privateemail_mcp.mail.append import append_with_retries, normalize_rfc822_crlf
 from privateemail_mcp.mail.parsing import build_message
 
 logger = logging.getLogger("privateemail_mcp.smtp")
@@ -35,17 +37,30 @@ class SmtpClient:
 
             msg["Date"] = format_datetime(datetime.now(timezone.utc))
 
-    async def _save_to_sent_bytes(self, raw: bytes) -> dict[str, Any]:
-        """IMAP APPEND into Sent — SMTP delivery alone does not create a Sent copy."""
-        from privateemail_mcp.mail.imap_client import imap_session
-
+    def _archive_bytes(self, msg: EmailMessage) -> bytes:
+        """Snapshot message bytes with CRLF endings for IMAP APPEND."""
         try:
-            async with imap_session(self.cfg) as imap:
-                await imap.append_message(raw, "Sent", flags=r"(\Seen)")
-            return {"saved_to_sent": True}
-        except Exception as e:
-            logger.warning("Failed to APPEND copy to Sent: %s", e)
-            return {"saved_to_sent": False, "sent_folder_error": str(e)}
+            raw = msg.as_bytes(policy=SMTP_POLICY)
+        except TypeError:
+            # Older EmailMessage.as_bytes may not accept policy kwarg.
+            raw = msg.as_bytes()
+        return normalize_rfc822_crlf(raw)
+
+    async def _save_to_sent_bytes(self, raw: bytes) -> dict[str, Any]:
+        """IMAP APPEND into Sent — required after every successful SMTP send."""
+        result = await append_with_retries(
+            self.cfg,
+            raw,
+            "Sent",
+            flags=r"(\Seen)",
+            attempts=3,
+            backoff_seconds=1.0,
+        )
+        return {
+            "saved_to_sent": True,
+            "sent_mailbox": "Sent",
+            "sent_append_attempts": result["attempts"],
+        }
 
     async def send_message(
         self,
@@ -64,7 +79,7 @@ class SmtpClient:
                         recipients.append(addr)
 
         # Snapshot for Sent (keeps Bcc) before stripping Bcc for SMTP
-        archive_bytes = msg.as_bytes()
+        archive_bytes = self._archive_bytes(msg)
 
         if "Bcc" in msg:
             del msg["Bcc"]
@@ -85,9 +100,21 @@ class SmtpClient:
             "message_id": mid,
             "recipients": recipients,
             "subject": msg.get("Subject"),
+            "smtp_delivered": True,
         }
         if save_to_sent:
-            result.update(await self._save_to_sent_bytes(archive_bytes))
+            try:
+                result.update(await self._save_to_sent_bytes(archive_bytes))
+            except Exception as exc:
+                # Delivery already happened — surface a hard failure so agents
+                # do not silently treat Sent archival as optional.
+                logger.error("SMTP delivered but Sent APPEND failed: %s", exc)
+                raise RuntimeError(
+                    f"Email was delivered via SMTP (message_id={mid}) but saving "
+                    f"a copy to the Sent folder failed after retries: {exc}. "
+                    "Do not assume the message is missing from recipients — "
+                    "retry save via IMAP APPEND, or re-check Sent after reconnect."
+                ) from exc
         return result
 
     async def send_email(
