@@ -6,13 +6,16 @@ It connects to `mail.privateemail.com` over IMAP and SMTP so Claude Code can rea
 This server is built for the Namecheap email provider called PrivateEmail.
 It is session scoped by design. Everything runs while Claude Code is connected to the server. There are no background workers, schedulers, or durable campaign daemons.
 
-## Reliability notes (v1.1.2)
+## Reliability notes (v1.1.3)
 
+- **Dependency pin:** requires `mcp[cli]>=1.6.0,<2.0.0`. MCP Python SDK 2.x removed FastMCP (`mcp.server.fastmcp`); an unpinned install pulls 2.0.0 and crashes on import. Use tag `v1.1.3` or newer.
 - Each IMAP tool call uses its own short-lived connection instead of one shared mailbox session
 - Inbox listings use header and snippet fetches instead of downloading full message bodies
 - Tool failures return clearer, agent-friendly error messages for bad UIDs, missing folders, and auth issues
 - Prompts such as `draft_reply` send compact email payloads instead of full HTML blobs
 - Sent-folder archival no longer uses fragile `aioimaplib` APPEND. After every SMTP send, the server archives a CRLF-normalized copy into `Sent` with stdlib `imaplib`, retries, and fails loudly if the Sent copy cannot be saved
+- `send_draft` rejects empty recipients or empty bodies before SMTP
+- Attachment paths are validated as real files before send
 
 ## What it does
 
@@ -97,6 +100,7 @@ claude mcp add --scope user \
 
 Notes:
 
+- Install from tag `v1.1.3` or newer (or current `main` after that release). Older tags still have an unpinned `mcp` dependency and will crash against MCP SDK 2.x.
 - `--scope user` installs it once for all your projects. Use `--scope project` if you want a repo-local setup instead.
 - Everything after the `--` separator is the command Claude Code runs.
 - `uvx --from git+... privateemail-mcp` installs and launches the server directly from GitHub.
@@ -179,6 +183,8 @@ Typical flows:
 uv sync
 uv run pytest tests/ -q
 ```
+
+Acceptance tests are Gherkin features under `features/`, executed via `pytest-bdd` from `tests/bdd/`. They are the release gate for dependency compatibility, config/error contracts, Sent archival helpers, prompt payload safety, outbound guards, and MCP surface inventory.
 
 Run locally:
 

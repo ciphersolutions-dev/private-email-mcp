@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from email.utils import parseaddr
+from pathlib import Path
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
@@ -90,8 +91,12 @@ def _attachment_list(paths: str | None) -> list[dict[str, Any]] | None:
     out = []
     for p in paths.split(","):
         p = p.strip()
-        if p:
-            out.append({"path": p, "filename": p.rsplit("/", 1)[-1]})
+        if not p:
+            continue
+        path = Path(p).expanduser()
+        if not path.is_file():
+            raise ValueError(f"Attachment path does not exist or is not a file: {p}")
+        out.append({"path": str(path.resolve()), "filename": path.name})
     return out or None
 
 
@@ -580,6 +585,9 @@ async def forward_email(
     note: Annotated[str | None, Field(description="Optional note above forwarded content")] = None,
 ) -> str:
     """Forward an email by UID to a new recipient."""
+    get_config().validate()
+    if not to.strip():
+        raise ValueError("Forward recipient (to) is required")
     folder = validate_folder(folder)
     uid = validate_uid(uid)
     original = await run_imap_tool(
@@ -677,11 +685,19 @@ async def send_draft(
         "read draft",
         lambda imap: imap.fetch_email("Drafts", uid),
     )
+    recipients = [a for a in (detail.to_addrs or []) if a and a.strip()]
+    if not recipients:
+        raise ValueError(
+            "Draft has no To recipients. Edit the draft with a valid To address "
+            "before calling send_draft."
+        )
+    if not (detail.text_body or detail.html_body):
+        raise ValueError("Draft has an empty body. Add text or HTML before sending.")
     try:
         result = await get_smtp().send_email(
-            to=detail.to_addrs or [""],
-            subject=detail.subject,
-            text=detail.text_body,
+            to=recipients,
+            subject=detail.subject or "(no subject)",
+            text=detail.text_body or None,
             html=detail.html_body or None,
             cc=", ".join(detail.cc_addrs) if detail.cc_addrs else None,
         )

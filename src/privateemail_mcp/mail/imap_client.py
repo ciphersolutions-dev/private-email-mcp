@@ -8,6 +8,7 @@ import logging
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 import aioimaplib
@@ -401,9 +402,13 @@ class ImapClient:
             "size": len(data),
         }
         if save_path:
-            with open(save_path, "wb") as f:
+            path = Path(save_path).expanduser()
+            if path.exists() and path.is_dir():
+                raise ValueError(f"save_path must be a file path, not a directory: {save_path}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "wb") as f:
                 f.write(data)
-            result["saved_to"] = save_path
+            result["saved_to"] = str(path.resolve())
         else:
             result["data_base64"] = base64.b64encode(data).decode("ascii")
         return result

@@ -71,7 +71,7 @@ def map_mail_error(exc: Exception, *, action: str) -> ToolError:
             "or narrow the search criteria."
         )
 
-    if "no message data" in lower or "fetch" in lower and "failed" in lower:
+    if "no message data" in lower or ("fetch" in lower and "failed" in lower):
         uid_hint = ""
         m = re.search(r"uid\s*(\d+)", lower)
         if m:
