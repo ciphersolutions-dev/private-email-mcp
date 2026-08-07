@@ -11,9 +11,7 @@ CRLF-normalized RFC822 bytes, quoted mailbox names, retries, and clear errors.
 from __future__ import annotations
 
 import asyncio
-import imaplib
 import logging
-import ssl
 from typing import Any
 
 from privateemail_mcp.config import Config
@@ -53,14 +51,22 @@ def _append_sync(
     mailbox: str,
     flags: str | None,
 ) -> str:
+    from privateemail_mcp.mail.transport import SyncImap4SSL, make_ssl_context, resolve_tls_hostname
+
     raw = normalize_rfc822_crlf(raw_message)
     mailbox_q = quote_mailbox(mailbox)
     flag_arg = flags
     if flag_arg is not None and not (flag_arg.startswith("(") and flag_arg.endswith(")")):
         flag_arg = f"({flag_arg})"
 
-    ctx = ssl.create_default_context()
-    client = imaplib.IMAP4_SSL(cfg.imap_host, cfg.imap_port, ssl_context=ctx, timeout=60)
+    timeout = min(cfg.connect_timeout, cfg.command_timeout)
+    client = SyncImap4SSL(
+        cfg.imap_host,
+        cfg.imap_port,
+        ssl_context=make_ssl_context(),
+        timeout=timeout,
+        tls_hostname=resolve_tls_hostname(cfg, for_imap=True),
+    )
     try:
         typ, data = client.login(cfg.address, cfg.password)
         if typ != "OK":

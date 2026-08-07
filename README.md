@@ -6,9 +6,11 @@ It connects to `mail.privateemail.com` over IMAP and SMTP so Claude Code can rea
 This server is built for the Namecheap email provider called PrivateEmail.
 It is session scoped by design. Everything runs while Claude Code is connected to the server. There are no background workers, schedulers, or durable campaign daemons.
 
-## Reliability notes (v1.1.3)
+## Reliability notes (v1.1.4)
 
-- **Dependency pin:** requires `mcp[cli]>=1.6.0,<2.0.0`. MCP Python SDK 2.x removed FastMCP (`mcp.server.fastmcp`); an unpinned install pulls 2.0.0 and crashes on import. Use tag `v1.1.3` or newer.
+- **VPN / firewall mail-port blocks:** many networks (including corporate VPNs) blackhole outbound IMAP `993` and SMTP `465`. Direct connects then hang until the client times out. Use `scripts/run-mcp-with-tunnel.sh` (SSH LocalForward via a host that can reach `mail.privateemail.com`, default `ubee`). The wrapper starts the tunnel and points IMAP/SMTP at `127.0.0.1:21993` / `127.0.0.1:21465` with `PRIVATEEMAIL_TLS_HOSTNAME=mail.privateemail.com`.
+- **Fail-fast timeouts:** `PRIVATEEMAIL_CONNECT_TIMEOUT` (default 12s) and `PRIVATEEMAIL_COMMAND_TIMEOUT` (default 30s) replace the old 60s hangs. Timeouts return an actionable tunnel hint instead of an ambiguous agent timeout.
+- **Dependency pin:** requires `mcp[cli]>=1.6.0,<2.0.0`. MCP Python SDK 2.x removed FastMCP (`mcp.server.fastmcp`); an unpinned install pulls 2.0.0 and crashes on import. Use tag `v1.1.3` or newer (prefer `v1.1.4`).
 - Each IMAP tool call uses its own short-lived connection instead of one shared mailbox session
 - Inbox listings use header and snippet fetches instead of downloading full message bodies
 - Tool failures return clearer, agent-friendly error messages for bad UIDs, missing folders, and auth issues
@@ -111,7 +113,19 @@ Notes:
 git clone https://github.com/ciphersolutions-dev/private-email-mcp.git
 cd private-email-mcp
 uv sync
+```
 
+If your network/VPN blocks outbound IMAP/SMTP (common), register the tunnel wrapper so Cursor starts the SSH LocalForward automatically:
+
+```bash
+# Cursor mcp.json command:
+#   /path/to/privateemail-mcp/scripts/run-mcp-with-tunnel.sh
+# with env PRIVATEEMAIL_ADDRESS / PASSWORD / DISPLAY_NAME / PRIVATEEMAIL_TUNNEL_SSH
+```
+
+Direct (no tunnel) when mail ports are reachable:
+
+```bash
 claude mcp add --scope user \
   --env PRIVATEEMAIL_ADDRESS="you@yourdomain.com" \
   --env PRIVATEEMAIL_PASSWORD="your-password" \
@@ -141,22 +155,30 @@ Environment variables:
 - `PRIVATEEMAIL_ADDRESS` - full mailbox address
 - `PRIVATEEMAIL_PASSWORD` - mailbox password
 - `PRIVATEEMAIL_DISPLAY_NAME` - display name used for outbound mail
-- `PRIVATEEMAIL_IMAP_HOST` - defaults to `mail.privateemail.com`
-- `PRIVATEEMAIL_IMAP_PORT` - defaults to `993`
-- `PRIVATEEMAIL_SMTP_HOST` - defaults to `mail.privateemail.com`
-- `PRIVATEEMAIL_SMTP_PORT` - defaults to `465`
+- `PRIVATEEMAIL_IMAP_HOST` - defaults to `mail.privateemail.com` (use `127.0.0.1` with the tunnel)
+- `PRIVATEEMAIL_IMAP_PORT` - defaults to `993` (tunnel default `21993`)
+- `PRIVATEEMAIL_SMTP_HOST` - defaults to `mail.privateemail.com` (use `127.0.0.1` with the tunnel)
+- `PRIVATEEMAIL_SMTP_PORT` - defaults to `465` (tunnel default `21465`)
+- `PRIVATEEMAIL_TLS_HOSTNAME` - TLS SNI/cert name when host is a tunnel loopback (default inferred as `mail.privateemail.com`)
+- `PRIVATEEMAIL_CONNECT_TIMEOUT` - TCP connect timeout seconds (default `12`)
+- `PRIVATEEMAIL_COMMAND_TIMEOUT` - IMAP/SMTP command timeout seconds (default `30`)
+- `PRIVATEEMAIL_TUNNEL_SSH` - SSH host alias for `scripts/mail-tunnel.sh` (default `ubee`)
 - `PRIVATEEMAIL_MAX_ATTACHMENT_BYTES` - maximum attachment payload returned by the server
 
-Example `.env`:
+Example `.env` (tunnel mode):
 
 ```bash
 PRIVATEEMAIL_ADDRESS=you@yourdomain.com
 PRIVATEEMAIL_PASSWORD=your-password
-PRIVATEEMAIL_IMAP_HOST=mail.privateemail.com
-PRIVATEEMAIL_IMAP_PORT=993
-PRIVATEEMAIL_SMTP_HOST=mail.privateemail.com
-PRIVATEEMAIL_SMTP_PORT=465
 PRIVATEEMAIL_DISPLAY_NAME=Your Name
+PRIVATEEMAIL_IMAP_HOST=127.0.0.1
+PRIVATEEMAIL_IMAP_PORT=21993
+PRIVATEEMAIL_SMTP_HOST=127.0.0.1
+PRIVATEEMAIL_SMTP_PORT=21465
+PRIVATEEMAIL_TLS_HOSTNAME=mail.privateemail.com
+PRIVATEEMAIL_TUNNEL_SSH=ubee
+PRIVATEEMAIL_CONNECT_TIMEOUT=12
+PRIVATEEMAIL_COMMAND_TIMEOUT=30
 PRIVATEEMAIL_MAX_ATTACHMENT_BYTES=10485760
 ```
 

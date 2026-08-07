@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import email
 import email.policy
 import logging
@@ -10,8 +11,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator
-
-import aioimaplib
 
 from privateemail_mcp.config import Config, get_config
 from privateemail_mcp.mail.models import EmailDetail, EmailSummary
@@ -22,6 +21,7 @@ from privateemail_mcp.mail.parsing import (
     summary_from_detail,
     _guess_has_attachments,
 )
+from privateemail_mcp.mail.transport import Imap4SSL, resolve_tls_hostname
 
 logger = logging.getLogger("privateemail_mcp.imap")
 
@@ -45,14 +45,37 @@ def normalize_folder(folder: str) -> str:
 class ImapClient:
     def __init__(self, cfg: Config | None = None):
         self.cfg = cfg or get_config()
-        self._client: aioimaplib.IMAP4_SSL | None = None
+        self._client: Imap4SSL | None = None
 
-    async def connect(self) -> aioimaplib.IMAP4_SSL:
+    async def connect(self) -> Imap4SSL:
         if self._client is not None and self._client.get_state() != "LOGOUT":
             return self._client
-        client = aioimaplib.IMAP4_SSL(host=self.cfg.imap_host, port=self.cfg.imap_port, timeout=60)
-        await client.wait_hello_from_server()
-        resp = await client.login(self.cfg.address, self.cfg.password)
+        # Fail fast when VPN/firewall blackholes mail ports (OS SYN retries can exceed 60s).
+        from privateemail_mcp.mail.transport import tcp_connect
+
+        probe = await asyncio.to_thread(
+            tcp_connect,
+            self.cfg.imap_host,
+            self.cfg.imap_port,
+            self.cfg.connect_timeout,
+        )
+        probe.close()
+        client = Imap4SSL(
+            host=self.cfg.imap_host,
+            port=self.cfg.imap_port,
+            timeout=self.cfg.command_timeout,
+            tls_hostname=resolve_tls_hostname(self.cfg, for_imap=True),
+        )
+        try:
+            await client.wait_hello_from_server()
+            resp = await client.login(self.cfg.address, self.cfg.password)
+        except Exception:
+            # Drop half-open clients so the next call opens a fresh socket.
+            try:
+                await client.logout()
+            except Exception:
+                pass
+            raise
         if resp.result != "OK":
             raise RuntimeError(f"IMAP login failed: {resp.lines}")
         self._client = client
@@ -86,7 +109,7 @@ class ImapClient:
             folders.append({"name": name, "delimiter": delim, "flags": flags})
         return folders
 
-    async def _select(self, folder: str, readonly: bool = True) -> aioimaplib.IMAP4_SSL:
+    async def _select(self, folder: str, readonly: bool = True) -> Imap4SSL:
         client = await self.connect()
         folder = normalize_folder(folder)
         # aioimaplib only transitions to SELECTED via select(); examine() does not
@@ -522,12 +545,11 @@ class ImapClient:
     async def health_check(self) -> dict[str, Any]:
         client = await self.connect()
         resp = await client.noop()
-        folders = await self.list_folders()
         return {
             "ok": resp.result == "OK",
             "host": self.cfg.imap_host,
             "port": self.cfg.imap_port,
-            "folder_count": len(folders),
+            "tls_hostname": resolve_tls_hostname(self.cfg, for_imap=True),
         }
 
 

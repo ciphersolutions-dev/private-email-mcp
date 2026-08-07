@@ -28,6 +28,7 @@ scenarios(
     str(FEATURE_DIR / "outbound_safety.feature"),
     str(FEATURE_DIR / "send_contract.feature"),
     str(FEATURE_DIR / "mcp_surface.feature"),
+    str(FEATURE_DIR / "network_tunnel.feature"),
 )
 
 
@@ -100,6 +101,44 @@ def set_password(isolated_env, value: str):
 @given(parsers.parse('PRIVATEEMAIL_IMAP_PORT is "{value}"'))
 def set_imap_port(isolated_env, value: str):
     isolated_env.setenv("PRIVATEEMAIL_IMAP_PORT", value)
+
+
+@given(parsers.parse('PRIVATEEMAIL_IMAP_HOST is "{value}"'))
+def set_imap_host(isolated_env, value: str):
+    isolated_env.setenv("PRIVATEEMAIL_IMAP_HOST", value)
+
+
+@given(parsers.parse('PRIVATEEMAIL_TLS_HOSTNAME is "{value}"'))
+def set_tls_hostname(isolated_env, value: str):
+    isolated_env.setenv("PRIVATEEMAIL_TLS_HOSTNAME", value)
+
+
+@then("the connect timeout is 12 seconds")
+def connect_timeout_default(ctx):
+    assert ctx.error is None
+    assert ctx.config.connect_timeout == 12.0
+
+
+@then("the command timeout is 30 seconds")
+def command_timeout_default(ctx):
+    assert ctx.error is None
+    assert ctx.config.command_timeout == 30.0
+
+
+@then(parsers.parse('the resolved IMAP TLS hostname is "{value}"'))
+def resolved_imap_tls_hostname(ctx, value: str):
+    from privateemail_mcp.mail.transport import resolve_tls_hostname
+
+    assert ctx.error is None
+    assert resolve_tls_hostname(ctx.config, for_imap=True) == value
+
+
+@given(parsers.parse('the IMAP host is "{value}"'))
+def imap_host_for_error_mapping(isolated_env, value: str):
+    # Provide enough env for get_config() during map_mail_error.
+    isolated_env.setenv("PRIVATEEMAIL_ADDRESS", "user@example.com")
+    isolated_env.setenv("PRIVATEEMAIL_PASSWORD", "secret")
+    isolated_env.setenv("PRIVATEEMAIL_IMAP_HOST", value)
 
 
 @when("configuration is validated")
@@ -583,6 +622,9 @@ def send_email_step(ctx, to: str, subject: str, text: str):
         smtp_host="mail.privateemail.com",
         smtp_port=465,
         max_attachment_bytes=10_000_000,
+        connect_timeout=12.0,
+        command_timeout=30.0,
+        tls_hostname="",
     )
     client = SmtpClient(cfg)
 

@@ -1,17 +1,12 @@
 {
   "mcpServers": {
     "privateemail": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/home/cipherlaptop2/privateemail-mcp",
-        "privateemail-mcp"
-      ],
+      "command": "/home/cipherlaptop2/privateemail-mcp/scripts/run-mcp-with-tunnel.sh",
       "env": {
         "PRIVATEEMAIL_ADDRESS": "you@yourdomain.com",
         "PRIVATEEMAIL_PASSWORD": "your-password",
-        "PRIVATEEMAIL_DISPLAY_NAME": "Your Name"
+        "PRIVATEEMAIL_DISPLAY_NAME": "Your Name",
+        "PRIVATEEMAIL_TUNNEL_SSH": "ubee"
       }
     }
   }

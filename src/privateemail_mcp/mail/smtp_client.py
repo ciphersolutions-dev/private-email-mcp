@@ -14,6 +14,12 @@ import aiosmtplib
 from privateemail_mcp.config import Config, get_config
 from privateemail_mcp.mail.append import append_with_retries, normalize_rfc822_crlf
 from privateemail_mcp.mail.parsing import build_message
+from privateemail_mcp.mail.transport import (
+    is_loopback_host,
+    make_ssl_context,
+    resolve_tls_hostname,
+    tcp_connect,
+)
 
 logger = logging.getLogger("privateemail_mcp.smtp")
 
@@ -62,6 +68,32 @@ class SmtpClient:
             "sent_append_attempts": result["attempts"],
         }
 
+    def _smtp_kwargs(self) -> dict[str, Any]:
+        tunneled = is_loopback_host(self.cfg.smtp_host)
+        # Tunnel forwards remote :465 (implicit TLS). Direct uses the configured port.
+        use_tls = True if tunneled else (self.cfg.smtp_port == 465)
+        tls_hostname = resolve_tls_hostname(self.cfg, for_imap=False)
+        kwargs: dict[str, Any] = {
+            "hostname": tls_hostname if tunneled else self.cfg.smtp_host,
+            "username": self.cfg.address,
+            "password": self.cfg.password,
+            "start_tls": not use_tls,
+            "use_tls": use_tls,
+            "timeout": self.cfg.command_timeout,
+            "tls_context": make_ssl_context(),
+        }
+        if tunneled:
+            # Pre-connect to the LocalForward; SNI/cert checks use mail.privateemail.com.
+            # aiosmtplib rejects port when sock is provided.
+            kwargs["sock"] = tcp_connect(
+                self.cfg.smtp_host,
+                self.cfg.smtp_port,
+                self.cfg.connect_timeout,
+            )
+        else:
+            kwargs["port"] = self.cfg.smtp_port
+        return kwargs
+
     async def send_message(
         self,
         msg: EmailMessage,
@@ -84,16 +116,7 @@ class SmtpClient:
         if "Bcc" in msg:
             del msg["Bcc"]
 
-        use_tls = self.cfg.smtp_port == 465
-        await aiosmtplib.send(
-            msg,
-            hostname=self.cfg.smtp_host,
-            port=self.cfg.smtp_port,
-            username=self.cfg.address,
-            password=self.cfg.password,
-            start_tls=not use_tls,
-            use_tls=use_tls,
-        )
+        await aiosmtplib.send(msg, **self._smtp_kwargs())
 
         result: dict[str, Any] = {
             "ok": True,
@@ -156,17 +179,26 @@ class SmtpClient:
         return await self.send_message(msg, save_to_sent=save_to_sent)
 
     async def health_check(self) -> dict[str, Any]:
-        use_tls = self.cfg.smtp_port == 465
+        kwargs = self._smtp_kwargs()
+        sock = kwargs.pop("sock", None)
         smtp = aiosmtplib.SMTP(
-            hostname=self.cfg.smtp_host,
-            port=self.cfg.smtp_port,
-            use_tls=use_tls,
-            start_tls=not use_tls,
+            hostname=kwargs["hostname"],
+            port=kwargs.get("port"),
+            use_tls=kwargs["use_tls"],
+            start_tls=kwargs["start_tls"],
+            timeout=kwargs["timeout"],
+            tls_context=kwargs["tls_context"],
+            sock=sock,
         )
         await smtp.connect()
         try:
             await smtp.login(self.cfg.address, self.cfg.password)
-            return {"ok": True, "host": self.cfg.smtp_host, "port": self.cfg.smtp_port}
+            return {
+                "ok": True,
+                "host": self.cfg.smtp_host,
+                "port": self.cfg.smtp_port,
+                "tls_hostname": resolve_tls_hostname(self.cfg, for_imap=False),
+            }
         finally:
             try:
                 await smtp.quit()

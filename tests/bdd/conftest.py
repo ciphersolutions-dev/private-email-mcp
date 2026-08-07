@@ -50,6 +50,10 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch):
         "PRIVATEEMAIL_SMTP_HOST",
         "PRIVATEEMAIL_SMTP_PORT",
         "PRIVATEEMAIL_MAX_ATTACHMENT_BYTES",
+        "PRIVATEEMAIL_CONNECT_TIMEOUT",
+        "PRIVATEEMAIL_COMMAND_TIMEOUT",
+        "PRIVATEEMAIL_TLS_HOSTNAME",
+        "PRIVATEEMAIL_TUNNEL_SSH",
     ]
     for key in keys:
         monkeypatch.delenv(key, raising=False)
